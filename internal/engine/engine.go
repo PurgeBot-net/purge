@@ -1,0 +1,527 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/disgoorg/disgo/bot"
+	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/snowflake/v2"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+
+	"github.com/PurgeBot-net/common/job"
+	"github.com/PurgeBot-net/database"
+	"github.com/PurgeBot-net/locale"
+	"github.com/PurgeBot-net/purger/config"
+)
+
+const (
+	bulkDeleteMaxAge = 14 * 24 * time.Hour
+	fetchBatchSize   = 100
+)
+
+type Engine struct {
+	cfg    config.Config
+	logger *zap.Logger
+	db     *database.Database
+	redis  *redis.Client
+	client *bot.Client
+}
+
+func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *redis.Client, client *bot.Client) *Engine {
+	return &Engine{cfg: cfg, logger: logger, db: db, redis: redis, client: client}
+}
+
+// execState holds per-job state shared across channel iterations.
+type execState struct {
+	// memberRoles caches guild member role lookups.
+	// Key absent = not yet fetched. Nil value = member not in guild.
+	memberRoles map[snowflake.ID][]snowflake.ID
+	// filterRegex is pre-compiled when FilterMode is regex; nil otherwise.
+	filterRegex *regexp.Regexp
+}
+
+func newExecState(j *job.PurgeJob) (*execState, error) {
+	s := &execState{
+		memberRoles: make(map[snowflake.ID][]snowflake.ID),
+	}
+	if j.FilterMode == job.FilterModeRegex && j.Filter != "" {
+		pattern := j.Filter
+		if !j.CaseSensitive {
+			pattern = "(?i)" + pattern
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("%s", locale.MsgPurgeInvalidRegex.In(j.Locale, err.Error()))
+		}
+		s.filterRegex = re
+	}
+	return s, nil
+}
+
+// getMemberRoles returns the member's role IDs and whether they are in the guild.
+// Results are cached to avoid repeated REST calls for the same user.
+func (s *execState) getMemberRoles(ctx context.Context, e *Engine, guildID, userID snowflake.ID) ([]snowflake.ID, bool) {
+	if roles, ok := s.memberRoles[userID]; ok {
+		return roles, roles != nil
+	}
+	member, err := e.client.Rest.GetMember(guildID, userID)
+	if err != nil {
+		s.memberRoles[userID] = nil
+		return nil, false
+	}
+	s.memberRoles[userID] = member.RoleIDs
+	return member.RoleIDs, true
+}
+
+type channelResult struct {
+	name    string
+	deleted int
+	err     error
+}
+
+// Execute runs a purge job end-to-end.
+func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
+	start := time.Now()
+	target := e.targetDisplay(j)
+
+	showBranding := true
+	if c, err := e.db.GetCustomization(ctx, int64(j.GuildID)); err == nil && c != nil {
+		showBranding = !c.RemoveBranding
+	}
+
+	state, err := newExecState(j)
+	if err != nil {
+		e.updateText(ctx, j, fmt.Sprintf("❌ %s", err.Error()))
+		return err
+	}
+
+	e.sendInProgress(ctx, j, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+
+	channels, err := e.resolveChannels(ctx, j)
+	if err != nil {
+		e.updateText(ctx, j, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
+		return err
+	}
+
+	var results []channelResult
+	var totalDeleted int
+
+	for _, channelID := range channels {
+		if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
+			e.sendCancelled(ctx, j, totalDeleted, showBranding)
+			return nil
+		}
+
+		chanName := fmt.Sprintf("<#%d>", channelID)
+		e.sendInProgress(ctx, j, target, locale.MsgPurgeStatusFetching.In(j.Locale, chanName), true)
+
+		deleted, err := e.purgeChannel(ctx, j, channelID, state)
+		results = append(results, channelResult{name: chanName, deleted: deleted, err: err})
+		if err != nil {
+			e.logger.Warn("channel purge failed", zap.Uint64("channel", channelID), zap.Error(err))
+		}
+		totalDeleted += deleted
+	}
+
+	elapsed := time.Since(start)
+	e.sendCompletion(ctx, j, target, totalDeleted, elapsed, results, showBranding)
+
+	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
+		GuildID:    int64(j.GuildID),
+		PurgeType:  string(j.PurgeType),
+		TargetType: string(j.TargetType),
+		Deleted:    totalDeleted,
+		DurationMs: int(elapsed.Milliseconds()),
+	}); err != nil {
+		e.logger.Warn("record purge event", zap.Error(err))
+	}
+
+	return nil
+}
+
+// resolveChannels returns the ordered list of channel (and thread) IDs to purge.
+func (e *Engine) resolveChannels(ctx context.Context, j *job.PurgeJob) ([]uint64, error) {
+	skipSet := make(map[uint64]bool, len(j.SkipChannelIDs))
+	for _, id := range j.SkipChannelIDs {
+		skipSet[id] = true
+	}
+
+	switch j.TargetType {
+	case job.TargetTypeChannel:
+		result := []uint64{j.TargetID}
+		if j.IncludeThreads {
+			threads := e.fetchThreadsForChannels(ctx, j.GuildID, result)
+			result = append(result, threads...)
+		}
+		return result, nil
+
+	case job.TargetTypeCategory:
+		channels, err := e.client.Rest.GetGuildChannels(snowflake.ID(j.GuildID))
+		if err != nil {
+			return nil, fmt.Errorf("fetch channels: %w", err)
+		}
+		var result, forumIDs, textThreadParents []uint64
+		for _, ch := range channels {
+			if ch.ParentID() == nil || uint64(*ch.ParentID()) != j.TargetID {
+				continue
+			}
+			if skipSet[uint64(ch.ID())] {
+				continue
+			}
+			switch ch.Type() {
+			case discord.ChannelTypeGuildText, discord.ChannelTypeGuildNews, discord.ChannelTypeGuildVoice:
+				result = append(result, uint64(ch.ID()))
+				if ch.Type() != discord.ChannelTypeGuildVoice {
+					textThreadParents = append(textThreadParents, uint64(ch.ID()))
+				}
+			case discord.ChannelTypeGuildForum:
+				forumIDs = append(forumIDs, uint64(ch.ID()))
+			}
+		}
+		// Forum threads are always included (the forum channel itself has no messages).
+		if len(forumIDs) > 0 {
+			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, forumIDs)...)
+		}
+		if j.IncludeThreads && len(textThreadParents) > 0 {
+			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, textThreadParents)...)
+		}
+		return result, nil
+
+	case job.TargetTypeServer:
+		channels, err := e.client.Rest.GetGuildChannels(snowflake.ID(j.GuildID))
+		if err != nil {
+			return nil, fmt.Errorf("fetch channels: %w", err)
+		}
+		var result, forumIDs, textThreadParents []uint64
+		for _, ch := range channels {
+			if skipSet[uint64(ch.ID())] {
+				continue
+			}
+			switch ch.Type() {
+			case discord.ChannelTypeGuildText, discord.ChannelTypeGuildNews, discord.ChannelTypeGuildVoice:
+				result = append(result, uint64(ch.ID()))
+				if ch.Type() != discord.ChannelTypeGuildVoice {
+					textThreadParents = append(textThreadParents, uint64(ch.ID()))
+				}
+			case discord.ChannelTypeGuildForum:
+				forumIDs = append(forumIDs, uint64(ch.ID()))
+			}
+		}
+		if len(forumIDs) > 0 {
+			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, forumIDs)...)
+		}
+		if j.IncludeThreads && len(textThreadParents) > 0 {
+			result = append(result, e.fetchThreadsForChannels(ctx, j.GuildID, textThreadParents)...)
+		}
+		return result, nil
+
+	default:
+		return nil, fmt.Errorf("unknown target type: %s", j.TargetType)
+	}
+}
+
+// fetchThreadsForChannels returns active and archived thread IDs whose parent is in parentIDs.
+func (e *Engine) fetchThreadsForChannels(ctx context.Context, guildID uint64, parentIDs []uint64) []uint64 {
+	parentSet := make(map[uint64]bool, len(parentIDs))
+	for _, id := range parentIDs {
+		parentSet[id] = true
+	}
+
+	var threadIDs []uint64
+
+	active, err := e.client.Rest.GetActiveGuildThreads(snowflake.ID(guildID))
+	if err == nil {
+		for _, t := range active.Threads {
+			if parentSet[uint64(*t.ParentID())] {
+				threadIDs = append(threadIDs, uint64(t.ID()))
+			}
+		}
+	} else {
+		e.logger.Warn("fetch active guild threads", zap.Error(err))
+	}
+
+	for _, chanID := range parentIDs {
+		cid := snowflake.ID(chanID)
+		if pub, err := e.client.Rest.GetPublicArchivedThreads(cid, time.Time{}, 0); err == nil {
+			for _, t := range pub.Threads {
+				threadIDs = append(threadIDs, uint64(t.ID()))
+			}
+		}
+		if priv, err := e.client.Rest.GetPrivateArchivedThreads(cid, time.Time{}, 0); err == nil {
+			for _, t := range priv.Threads {
+				threadIDs = append(threadIDs, uint64(t.ID()))
+			}
+		}
+	}
+
+	return threadIDs
+}
+
+// purgeChannel fetches and deletes matching messages from a single channel or thread.
+func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID uint64, state *execState) (int, error) {
+	var (
+		deleted  int
+		beforeID snowflake.ID
+		cutoff   time.Time
+	)
+	if j.Days > 0 {
+		cutoff = time.Now().Add(-time.Duration(j.Days) * 24 * time.Hour)
+	}
+
+	cid := snowflake.ID(channelID)
+
+	for {
+		if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
+			break
+		}
+
+		messages, err := e.client.Rest.GetMessages(cid, 0, beforeID, 0, fetchBatchSize)
+		if err != nil {
+			return deleted, fmt.Errorf("fetch messages: %w", err)
+		}
+		if len(messages) == 0 {
+			break
+		}
+
+		var toDelete []snowflake.ID
+		var oldMessages []snowflake.ID
+		var atCutoff bool
+
+		for _, msg := range messages {
+			if !cutoff.IsZero() && msg.CreatedAt.Before(cutoff) {
+				atCutoff = true
+				break
+			}
+			if !e.matchesJob(ctx, j, msg, state) {
+				continue
+			}
+			if time.Since(msg.CreatedAt) < bulkDeleteMaxAge {
+				toDelete = append(toDelete, msg.ID)
+			} else {
+				oldMessages = append(oldMessages, msg.ID)
+			}
+		}
+
+		if len(messages) > 0 {
+			beforeID = messages[len(messages)-1].ID
+		}
+
+		for len(toDelete) > 0 {
+			batch := toDelete
+			if len(batch) > 100 {
+				batch = toDelete[:100]
+			}
+			toDelete = toDelete[len(batch):]
+			if len(batch) == 1 {
+				if e.client.Rest.DeleteMessage(cid, batch[0]) == nil {
+					deleted++
+				}
+			} else {
+				if err := e.client.Rest.BulkDeleteMessages(cid, batch); err == nil {
+					deleted += len(batch)
+				}
+			}
+		}
+		for _, id := range oldMessages {
+			if e.client.Rest.DeleteMessage(cid, id) == nil {
+				deleted++
+			}
+		}
+
+		if atCutoff || len(messages) < fetchBatchSize {
+			break
+		}
+	}
+
+	return deleted, nil
+}
+
+// matchesJob returns true if the message should be deleted.
+func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Message, state *execState) bool {
+	guildID := snowflake.ID(j.GuildID)
+
+	switch j.PurgeType {
+	case job.PurgeTypeUser:
+		if msg.Author.ID != snowflake.ID(j.FilterUserID) {
+			return false
+		}
+
+	case job.PurgeTypeRole:
+		roles, isMember := state.getMemberRoles(ctx, e, guildID, msg.Author.ID)
+		if !isMember {
+			return false
+		}
+		hasRole := false
+		for _, r := range roles {
+			if uint64(r) == j.FilterRoleID {
+				hasRole = true
+				break
+			}
+		}
+		if !hasRole {
+			return false
+		}
+
+	case job.PurgeTypeEveryone:
+		if !j.IncludeBots && msg.Author.Bot {
+			return false
+		}
+
+	case job.PurgeTypeInactive:
+		if !j.IncludeBots && msg.Author.Bot {
+			return false
+		}
+		_, isMember := state.getMemberRoles(ctx, e, guildID, msg.Author.ID)
+		if isMember {
+			return false
+		}
+
+	case job.PurgeTypeWebhook:
+		if msg.WebhookID == nil {
+			return false
+		}
+
+	case job.PurgeTypeDeleted:
+		if msg.Author.Bot {
+			return false
+		}
+		if !strings.HasPrefix(msg.Author.Username, "Deleted User") || msg.Author.Discriminator != "0000" {
+			return false
+		}
+	}
+
+	return e.matchesFilter(j, msg.Content, state)
+}
+
+func (e *Engine) matchesFilter(j *job.PurgeJob, content string, state *execState) bool {
+	if j.Filter == "" {
+		return true
+	}
+	if j.FilterMode == job.FilterModeRegex {
+		if state.filterRegex == nil {
+			return false
+		}
+		return state.filterRegex.MatchString(content)
+	}
+	text, filter := content, j.Filter
+	if !j.CaseSensitive {
+		text = strings.ToLower(text)
+		filter = strings.ToLower(filter)
+	}
+	switch j.FilterMode {
+	case job.FilterModeExact:
+		return text == filter
+	case job.FilterModeStartsWith:
+		return strings.HasPrefix(text, filter)
+	case job.FilterModeEndsWith:
+		return strings.HasSuffix(text, filter)
+	default:
+		return strings.Contains(text, filter)
+	}
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+
+func (e *Engine) targetDisplay(j *job.PurgeJob) string {
+	if j.TargetType == job.TargetTypeServer {
+		return locale.MsgTargetServer.In(j.Locale)
+	}
+	return fmt.Sprintf("<#%d>", j.TargetID)
+}
+
+func cancelButton(j *job.PurgeJob) discord.ActionRowComponent {
+	return discord.ActionRowComponent{Components: []discord.InteractiveComponent{
+		discord.ButtonComponent{
+			Style:    discord.ButtonStyleDanger,
+			Label:    locale.MsgCancelButton.In(j.Locale),
+			CustomID: fmt.Sprintf("cancel:%s:%d", j.ID, j.RequestedByID),
+			Emoji:    &discord.ComponentEmoji{Name: "🛑"},
+		},
+	}}
+}
+
+func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, target, status string, withCancel bool) {
+	container := discord.NewContainer(
+		discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
+		discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, status)),
+	)
+	components := []discord.LayoutComponent{container}
+	if withCancel {
+		components = append(components, cancelButton(j))
+	}
+	e.updateComponents(ctx, j, components...)
+}
+
+func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, totalDeleted int, showBranding bool) {
+	msg := locale.MsgPurgeCancelledHeader.In(j.Locale)
+	if totalDeleted > 0 {
+		msg += locale.MsgPurgeCancelledCount.In(j.Locale, totalDeleted)
+	}
+	texts := []discord.ContainerSubComponent{discord.NewTextDisplay(msg)}
+	if showBranding {
+		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
+	}
+	e.updateComponents(ctx, j, discord.NewContainer(texts...))
+}
+
+func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, target string, totalDeleted int, elapsed time.Duration, results []channelResult, showBranding bool) {
+	texts := []discord.ContainerSubComponent{
+		discord.NewTextDisplay(locale.MsgPurgeCompleteHeader.In(j.Locale, target)),
+		discord.NewTextDisplay(locale.MsgPurgeCompleteTotalDeleted.In(j.Locale, totalDeleted)),
+		discord.NewTextDisplay(locale.MsgPurgeCompleteDuration.In(j.Locale, elapsed.Seconds())),
+		discord.NewTextDisplay(locale.MsgPurgeCompleteChannelsProcessed.In(j.Locale, len(results))),
+	}
+
+	var nonEmpty []channelResult
+	for _, r := range results {
+		if r.deleted > 0 {
+			nonEmpty = append(nonEmpty, r)
+		}
+	}
+	if len(results) <= 10 && len(nonEmpty) > 0 {
+		lines := make([]string, len(nonEmpty))
+		for i, r := range nonEmpty {
+			lines[i] = locale.MsgPurgeCompleteChannelLine.In(j.Locale, r.name, r.deleted)
+		}
+		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteChannelBreakdown.In(j.Locale, strings.Join(lines, "\n"))))
+	}
+
+	var skipped []channelResult
+	for _, r := range results {
+		if r.err != nil {
+			skipped = append(skipped, r)
+		}
+	}
+	if len(skipped) > 0 {
+		lines := make([]string, len(skipped))
+		for i, r := range skipped {
+			lines[i] = locale.MsgPurgeCompleteSkippedLine.In(j.Locale, r.name, r.err.Error())
+		}
+		texts = append(texts, discord.NewTextDisplay(locale.MsgPurgeCompleteSkippedChannels.In(j.Locale, strings.Join(lines, "\n"))))
+	}
+
+	if showBranding {
+		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
+	}
+	e.updateComponents(ctx, j, discord.NewContainer(texts...))
+}
+
+func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, text string) {
+	e.updateComponents(ctx, j, discord.NewContainer(discord.NewTextDisplay(text)))
+}
+
+func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, components ...discord.LayoutComponent) {
+	_, err := e.client.Rest.UpdateInteractionResponse(
+		snowflake.ID(j.ApplicationID),
+		j.InteractionToken,
+		discord.NewMessageUpdateV2(components...),
+	)
+	if err != nil {
+		e.logger.Warn("update interaction", zap.Error(err))
+	}
+}
