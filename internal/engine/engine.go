@@ -128,6 +128,11 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		totalDeleted += deleted
 	}
 
+	if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
+		e.sendCancelled(ctx, j, totalDeleted, showBranding)
+		return nil
+	}
+
 	elapsed := time.Since(start)
 	e.sendCompletion(ctx, j, target, totalDeleted, elapsed, results, showBranding)
 
