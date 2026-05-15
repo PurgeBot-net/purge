@@ -35,6 +35,8 @@ func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *re
 // Run blocks, consuming purge jobs from Redis until ctx is cancelled.
 func (w *Worker) Run(ctx context.Context) {
 	w.logger.Info("purge worker started")
+	w.recoverActiveJobs(ctx)
+	eng := engine.New(w.cfg, w.logger, w.db, w.redis, w.client)
 	for {
 		select {
 		case <-ctx.Done():
@@ -61,11 +63,26 @@ func (w *Worker) Run(ctx context.Context) {
 			zap.String("type", string(j.PurgeType)),
 		)
 
-		eng := engine.New(w.cfg, w.logger, w.db, w.redis, w.client)
 		if err := eng.Execute(ctx, j); err != nil {
 			w.logger.Error("purge job failed", zap.String("id", j.ID), zap.Error(err))
 		}
 
-		job.UnlockGuild(ctx, w.redis, j.GuildID, j.ID) //nolint:errcheck
+		job.DeleteActiveJob(ctx, w.redis, j.GuildID)
+	}
+}
+
+// recoverActiveJobs re-queues any jobs that were active when the worker last crashed.
+func (w *Worker) recoverActiveJobs(ctx context.Context) {
+	jobs, err := job.GetAllActiveJobs(ctx, w.redis)
+	if err != nil {
+		w.logger.Error("scan active jobs for recovery", zap.Error(err))
+		return
+	}
+	for _, j := range jobs {
+		if err := job.Enqueue(ctx, w.redis, j); err != nil {
+			w.logger.Error("re-enqueue recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID), zap.Error(err))
+		} else {
+			w.logger.Info("recovered active job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID))
+		}
 	}
 }
