@@ -43,6 +43,9 @@ type execState struct {
 	memberRoles map[snowflake.ID][]snowflake.ID
 	// filterRegex is pre-compiled when FilterMode is regex; nil otherwise.
 	filterRegex *regexp.Regexp
+	// commandMessageID is the ID of the purge command's interaction response.
+	// It is always excluded from deletion regardless of purge settings.
+	commandMessageID snowflake.ID
 }
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
@@ -98,6 +101,12 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	if err != nil {
 		e.updateText(ctx, j, fmt.Sprintf("❌ %s", err.Error()))
 		return err
+	}
+
+	if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
+		state.commandMessageID = msg.ID
+	} else {
+		e.logger.Warn("fetch interaction response for command message skip", zap.Error(err))
 	}
 
 	e.sendInProgress(ctx, j, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
@@ -301,6 +310,9 @@ func (e *Engine) purgeChannel(ctx context.Context, j *job.PurgeJob, channelID ui
 			if !cutoff.IsZero() && msg.CreatedAt.Before(cutoff) {
 				atCutoff = true
 				break
+			}
+			if state.commandMessageID != 0 && msg.ID == state.commandMessageID {
+				continue
 			}
 			if !e.matchesJob(ctx, j, msg, state) {
 				continue
