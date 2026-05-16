@@ -418,6 +418,11 @@ func (e *Engine) matchesJob(ctx context.Context, j *job.PurgeJob, msg discord.Me
 			return false
 		}
 
+	case job.PurgeTypeBot:
+		if !msg.Author.Bot {
+			return false
+		}
+
 	case job.PurgeTypeInactive:
 		if !j.IncludeBots && msg.Author.Bot {
 			return false
