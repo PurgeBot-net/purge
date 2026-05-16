@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/disgoorg/disgo"
@@ -32,15 +33,35 @@ func New(cfg config.Config, logger *zap.Logger, db *database.Database, redis *re
 	return &Worker{cfg: cfg, logger: logger, db: db, redis: redis, client: client}, nil
 }
 
-// Run blocks, consuming purge jobs from Redis until ctx is cancelled.
+// Run blocks, spawning WorkerConcurrency goroutines that consume purge jobs
+// from Redis concurrently. Returns when ctx is cancelled and all goroutines exit.
 func (w *Worker) Run(ctx context.Context) {
-	w.logger.Info("purge worker started")
 	w.recoverActiveJobs(ctx)
+
+	concurrency := w.cfg.WorkerConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	w.logger.Info("purge worker started", zap.Int("concurrency", concurrency))
+
 	eng := engine.New(w.cfg, w.logger, w.db, w.redis, w.client)
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.loop(ctx, eng)
+		}()
+	}
+	wg.Wait()
+	w.logger.Info("purge worker stopped")
+}
+
+// loop is the per-goroutine dequeue-and-execute cycle.
+func (w *Worker) loop(ctx context.Context, eng *engine.Engine) {
 	for {
 		select {
 		case <-ctx.Done():
-			w.logger.Info("purge worker stopped")
 			return
 		default:
 		}

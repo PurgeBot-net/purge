@@ -23,6 +23,9 @@ type Config struct {
 	RedisPassword string `env:"REDIS_PASSWORD"`
 	RedisDB       int    `env:"REDIS_DB"       envDefault:"0"`
 
+	// Worker
+	WorkerConcurrency int `env:"WORKER_CONCURRENCY" envDefault:"4"`
+
 	// Observability
 	SentryDSN string `env:"SENTRY_DSN"`
 	LogLevel  string `env:"LOG_LEVEL"  envDefault:"info"`
