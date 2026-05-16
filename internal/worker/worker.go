@@ -57,6 +57,17 @@ func (w *Worker) Run(ctx context.Context) {
 			continue // timeout, loop again
 		}
 
+		// Guard against double-enqueue: skip if this is a stale copy of a recovered job.
+		active, err := job.GetActiveJob(ctx, w.redis, j.GuildID)
+		if err != nil {
+			w.logger.Error("verify active job", zap.String("id", j.ID), zap.Error(err))
+			continue
+		}
+		if active == nil || active.ID != j.ID {
+			w.logger.Info("skipping stale recovered job", zap.String("id", j.ID), zap.Uint64("guild_id", j.GuildID))
+			continue
+		}
+
 		w.logger.Info("processing purge job",
 			zap.String("id", j.ID),
 			zap.Uint64("guild_id", j.GuildID),

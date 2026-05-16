@@ -102,32 +102,43 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 		showBranding = !c.RemoveBranding
 	}
 
-	state, err := newExecState(j)
-	if err != nil {
-		e.updateText(ctx, j, state, fmt.Sprintf("❌ %s", err.Error()))
-		return err
-	}
-
+	// Set up the response channel before anything else so errors can always be delivered.
+	var commandMsgID, fallbackChanID, fallbackMsgID snowflake.ID
+	fallbackJustCreated := false
 	if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
-		state.commandMessageID = msg.ID
-	} else {
-		// Interaction token expired (e.g. worker restarted after a crash).
-		// Create a fresh status message in the original channel instead.
+		commandMsgID = msg.ID
+	} else if j.InteractionChannelID != 0 {
 		e.logger.Warn("interaction token expired, falling back to channel message", zap.Error(err))
-		if j.InteractionChannelID != 0 {
-			cid := snowflake.ID(j.InteractionChannelID)
-			if msg, err := e.client.Rest.CreateMessage(cid, discord.NewMessageCreate().
-				WithContent(locale.MsgPurgeStatusStarting.In(j.Locale)),
-			); err == nil {
-				state.fallbackChannelID = cid
-				state.fallbackMessageID = msg.ID
-			} else {
-				e.logger.Warn("create fallback status message", zap.Error(err))
-			}
+		cid := snowflake.ID(j.InteractionChannelID)
+		startContainer := discord.NewContainer(
+			discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
+			discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, locale.MsgPurgeStatusStarting.In(j.Locale))),
+		)
+		if msg, err := e.client.Rest.CreateMessage(cid, discord.MessageCreate{
+			Flags:      discord.MessageFlagIsComponentsV2,
+			Components: []discord.LayoutComponent{startContainer, cancelButton(j)},
+		}); err == nil {
+			fallbackChanID = cid
+			fallbackMsgID = msg.ID
+			fallbackJustCreated = true
+		} else {
+			e.logger.Warn("create fallback status message", zap.Error(err))
 		}
 	}
 
-	e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+	state, err := newExecState(j)
+	if err != nil {
+		errState := &execState{fallbackChannelID: fallbackChanID, fallbackMessageID: fallbackMsgID}
+		e.updateText(ctx, j, errState, fmt.Sprintf("❌ %s", err.Error()))
+		return err
+	}
+	state.commandMessageID = commandMsgID
+	state.fallbackChannelID = fallbackChanID
+	state.fallbackMessageID = fallbackMsgID
+
+	if !fallbackJustCreated {
+		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+	}
 
 	channels, err := e.resolveChannels(ctx, j)
 	if err != nil {
