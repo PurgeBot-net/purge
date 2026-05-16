@@ -46,6 +46,11 @@ type execState struct {
 	// commandMessageID is the ID of the purge command's interaction response.
 	// It is always excluded from deletion regardless of purge settings.
 	commandMessageID snowflake.ID
+	// fallbackChannelID and fallbackMessageID are used when the interaction
+	// token has expired (e.g. after a worker crash/restart). Status updates
+	// are sent by editing a regular channel message instead.
+	fallbackChannelID snowflake.ID
+	fallbackMessageID snowflake.ID
 }
 
 func newExecState(j *job.PurgeJob) (*execState, error) {
@@ -99,21 +104,34 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 
 	state, err := newExecState(j)
 	if err != nil {
-		e.updateText(ctx, j, fmt.Sprintf("❌ %s", err.Error()))
+		e.updateText(ctx, j, state, fmt.Sprintf("❌ %s", err.Error()))
 		return err
 	}
 
 	if msg, err := e.client.Rest.GetInteractionResponse(snowflake.ID(j.ApplicationID), j.InteractionToken); err == nil {
 		state.commandMessageID = msg.ID
 	} else {
-		e.logger.Warn("fetch interaction response for command message skip", zap.Error(err))
+		// Interaction token expired (e.g. worker restarted after a crash).
+		// Create a fresh status message in the original channel instead.
+		e.logger.Warn("interaction token expired, falling back to channel message", zap.Error(err))
+		if j.InteractionChannelID != 0 {
+			cid := snowflake.ID(j.InteractionChannelID)
+			if msg, err := e.client.Rest.CreateMessage(cid, discord.NewMessageCreate().
+				WithContent(locale.MsgPurgeStatusStarting.In(j.Locale)),
+			); err == nil {
+				state.fallbackChannelID = cid
+				state.fallbackMessageID = msg.ID
+			} else {
+				e.logger.Warn("create fallback status message", zap.Error(err))
+			}
+		}
 	}
 
-	e.sendInProgress(ctx, j, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
+	e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusStarting.In(j.Locale), true)
 
 	channels, err := e.resolveChannels(ctx, j)
 	if err != nil {
-		e.updateText(ctx, j, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
+		e.updateText(ctx, j, state, locale.MsgPurgeResolveError.In(j.Locale, err.Error()))
 		return err
 	}
 
@@ -122,12 +140,12 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 
 	for _, channelID := range channels {
 		if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
-			e.sendCancelled(ctx, j, totalDeleted, showBranding)
+			e.sendCancelled(ctx, j, state, totalDeleted, showBranding)
 			return nil
 		}
 
 		chanName := fmt.Sprintf("<#%d>", channelID)
-		e.sendInProgress(ctx, j, target, locale.MsgPurgeStatusFetching.In(j.Locale, chanName), true)
+		e.sendInProgress(ctx, j, state, target, locale.MsgPurgeStatusFetching.In(j.Locale, chanName), true)
 
 		deleted, err := e.purgeChannel(ctx, j, channelID, state)
 		results = append(results, channelResult{name: chanName, deleted: deleted, err: err})
@@ -138,12 +156,12 @@ func (e *Engine) Execute(ctx context.Context, j *job.PurgeJob) error {
 	}
 
 	if cancelled, _ := job.IsCancelled(ctx, e.redis, j.ID); cancelled {
-		e.sendCancelled(ctx, j, totalDeleted, showBranding)
+		e.sendCancelled(ctx, j, state, totalDeleted, showBranding)
 		return nil
 	}
 
 	elapsed := time.Since(start)
-	e.sendCompletion(ctx, j, target, totalDeleted, elapsed, results, showBranding)
+	e.sendCompletion(ctx, j, state, target, totalDeleted, elapsed, results, showBranding)
 
 	if err := e.db.RecordPurgeEvent(ctx, database.RecordPurgeEventParams{
 		GuildID:    int64(j.GuildID),
@@ -462,7 +480,7 @@ func cancelButton(j *job.PurgeJob) discord.ActionRowComponent {
 	}}
 }
 
-func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, target, status string, withCancel bool) {
+func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, state *execState, target, status string, withCancel bool) {
 	container := discord.NewContainer(
 		discord.NewTextDisplay(locale.MsgPurgeInProgress.In(j.Locale, target)),
 		discord.NewTextDisplay(locale.MsgPurgeStatusLabel.In(j.Locale, status)),
@@ -471,10 +489,10 @@ func (e *Engine) sendInProgress(ctx context.Context, j *job.PurgeJob, target, st
 	if withCancel {
 		components = append(components, cancelButton(j))
 	}
-	e.updateComponents(ctx, j, components...)
+	e.updateComponents(ctx, j, state, components...)
 }
 
-func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, totalDeleted int, showBranding bool) {
+func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, state *execState, totalDeleted int, showBranding bool) {
 	msg := locale.MsgPurgeCancelledHeader.In(j.Locale)
 	if totalDeleted > 0 {
 		msg += locale.MsgPurgeCancelledCount.In(j.Locale, totalDeleted)
@@ -483,10 +501,10 @@ func (e *Engine) sendCancelled(ctx context.Context, j *job.PurgeJob, totalDelete
 	if showBranding {
 		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
 	}
-	e.updateComponents(ctx, j, discord.NewContainer(texts...))
+	e.updateComponents(ctx, j, state, discord.NewContainer(texts...))
 }
 
-func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, target string, totalDeleted int, elapsed time.Duration, results []channelResult, showBranding bool) {
+func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, state *execState, target string, totalDeleted int, elapsed time.Duration, results []channelResult, showBranding bool) {
 	texts := []discord.ContainerSubComponent{
 		discord.NewTextDisplay(locale.MsgPurgeCompleteHeader.In(j.Locale, target)),
 		discord.NewTextDisplay(locale.MsgPurgeCompleteTotalDeleted.In(j.Locale, totalDeleted)),
@@ -525,14 +543,25 @@ func (e *Engine) sendCompletion(ctx context.Context, j *job.PurgeJob, target str
 	if showBranding {
 		texts = append(texts, discord.NewTextDisplay("-# Powered by PurgeBot"))
 	}
-	e.updateComponents(ctx, j, discord.NewContainer(texts...))
+	e.updateComponents(ctx, j, state, discord.NewContainer(texts...))
 }
 
-func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, text string) {
-	e.updateComponents(ctx, j, discord.NewContainer(discord.NewTextDisplay(text)))
+func (e *Engine) updateText(ctx context.Context, j *job.PurgeJob, state *execState, text string) {
+	e.updateComponents(ctx, j, state, discord.NewContainer(discord.NewTextDisplay(text)))
 }
 
-func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, components ...discord.LayoutComponent) {
+func (e *Engine) updateComponents(ctx context.Context, j *job.PurgeJob, state *execState, components ...discord.LayoutComponent) {
+	if state.fallbackMessageID != 0 {
+		_, err := e.client.Rest.UpdateMessage(
+			state.fallbackChannelID,
+			state.fallbackMessageID,
+			discord.NewMessageUpdateV2(components...),
+		)
+		if err != nil {
+			e.logger.Warn("update fallback message", zap.Error(err))
+		}
+		return
+	}
 	_, err := e.client.Rest.UpdateInteractionResponse(
 		snowflake.ID(j.ApplicationID),
 		j.InteractionToken,
